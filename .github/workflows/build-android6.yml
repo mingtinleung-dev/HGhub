@@ -140,17 +140,18 @@ jobs:
           fi
 
       # ---- 8. 构建 APK ----
-      # 必须传 --target 指定所有架构,否则 Tauri 只编译默认的 aarch64
-      # BlueStacks 是 x86_64,缺少 x86_64 的 .so 会导致安装失败
+      # 不传 --target!Tauri 2 会自动遍历所有已安装的 Rust target 全部编译
+      # Rust_TARGETS 里装了 aarch64 + armv7 + x86_64 三个,Tauri 会全打包进一个 APK
+      # 传 --target 反而会透传给 cargo 导致 "could not find specification for target" 错误
       # Tauri 2 的 android build 默认即 debug,无需也不能传 --debug
       # release 需显式传 --release
       - name: Build APK (debug)
         if: github.event.inputs.build_type != 'release'
-        run: pnpm android:build -- --target aarch64 --target armv7 --target x86_64
+        run: pnpm android:build
 
       - name: Build APK (release)
         if: github.event.inputs.build_type == 'release' || startsWith(github.ref, 'refs/tags/v')
-        run: pnpm android:build -- --target aarch64 --target armv7 --target x86_64 --release
+        run: pnpm android:build -- --release
 
       # ---- 9. 收集产物 ----
       # 不硬编码 APK 路径,自动递归搜索整个 build/outputs 目录
