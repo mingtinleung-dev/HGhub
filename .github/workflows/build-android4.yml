@@ -1,0 +1,140 @@
+name: Build Android APK
+
+# 触发方式:
+#   1. 手动触发:GitHub 仓库页面 Actions 标签页 → 选 "Build Android APK" → Run workflow
+#   2. 推送 tag(如 v1.2.0)时自动触发并产出 Release
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "构建类型 (debug / release)"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    tags:
+      - "v*"
+
+env:
+  # Rust Android 目标架构(按需增减;最少保留 aarch64)
+  Rust_TARGETS: "aarch64-linux-android armv7-linux-androideabi x86_64-linux-android"
+  # NDK 版本号——与下面 sdkmanager 安装的版本必须一致
+  NDK_VERSION: "27.2.12479018"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---- 1. 拉取源码 ----
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 2. 安装 pnpm + Node ----
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # ---- 3. 安装 JDK 17 ----
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ---- 4. 安装 Rust ----
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.Rust_TARGETS }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-android-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-android-${{ runner.os }}-
+
+      # ---- 5. 安装 Android SDK + NDK ----
+      # 直接用 runner 预装的 sdkmanager,预接受所有 license,避免交互卡死
+      - name: Accept SDK licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+
+      - name: Install SDK platform, build-tools and NDK
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Export NDK_HOME
+        run: echo "NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      # ---- 6. 安装前端依赖 ----
+      - name: Install dependencies
+        run: pnpm install
+
+      # ---- 7. 初始化 Android 工程(首次必做) ----
+      - name: Init Android project
+        run: pnpm android:init
+
+      # ---- 8. 构建 APK ----
+      # Tauri 2 的 android build 默认即 debug,无需也不能传 --debug
+      # release 需显式传 --release
+      - name: Build APK (debug)
+        if: github.event.inputs.build_type != 'release'
+        run: pnpm android:build
+
+      - name: Build APK (release)
+        if: github.event.inputs.build_type == 'release' || startsWith(github.ref, 'refs/tags/v')
+        run: pnpm android:build -- --release
+
+      # ---- 9. 收集产物 ----
+      - name: Locate and rename APK
+        run: |
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk"
+          TYPE="${{ github.event.inputs.build_type }}"
+          # tag 触发时 inputs.build_type 为空,默认走 release
+          if [ -z "$TYPE" ]; then
+            TYPE="release"
+          fi
+
+          mkdir -p artifacts
+          if [ "$TYPE" = "release" ]; then
+            cp "$APK_DIR/release/app-release-unsigned.apk" artifacts/HGhub-release.apk 2>/dev/null || \
+            cp "$APK_DIR/release/app-release.apk" artifacts/HGhub-release.apk
+          else
+            cp "$APK_DIR/debug/app-debug.apk" artifacts/HGhub-debug.apk
+          fi
+          ls -lh artifacts/
+
+      # ---- 10. 上传为 Artifact(手动触发时)----
+      - name: Upload APK artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-apk
+          path: artifacts/*.apk
+          retention-days: 14
+
+      # ---- 11. 发布到 Release(tag 触发时)----
+      - name: Release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.apk
+          generate_release_notes: true
