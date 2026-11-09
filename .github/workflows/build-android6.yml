@@ -151,22 +151,53 @@ jobs:
         run: pnpm android:build -- --release
 
       # ---- 9. 收集产物 ----
-      - name: Locate and rename APK
+      # 不硬编码 APK 路径,自动递归搜索整个 build/outputs 目录
+      # Tauri 2 + Gradle 的实际输出路径可能很深(如 apk/universal/debug/)
+      - name: Locate and collect APK
         run: |
-          APK_DIR="src-tauri/gen/android/app/build/outputs/apk"
+          APK_ROOT="src-tauri/gen/android/app/build/outputs/apk"
           TYPE="${{ github.event.inputs.build_type }}"
           # tag 触发时 inputs.build_type 为空,默认走 release
           if [ -z "$TYPE" ]; then
             TYPE="release"
           fi
 
+          echo "=== 构建类型: $TYPE ==="
+          echo "=== APK 根目录: $APK_ROOT ==="
+          echo "=== 该目录下所有 .apk 文件 ==="
+          find "$APK_ROOT" -name "*.apk" -type f 2>/dev/null || echo "(目录不存在或无 apk 文件)"
+
           mkdir -p artifacts
+
+          # 用 find 自动递归搜索,匹配构建类型对应的子目录
+          FOUND_APK=""
           if [ "$TYPE" = "release" ]; then
-            cp "$APK_DIR/release/app-release-unsigned.apk" artifacts/HGhub-release.apk 2>/dev/null || \
-            cp "$APK_DIR/release/app-release.apk" artifacts/HGhub-release.apk
+            # release 可能的文件名: app-release.apk / app-release-unsigned.apk / app-universal-release-unsigned.apk
+            FOUND_APK=$(find "$APK_ROOT" -name "*.apk" -path "*release*" -type f 2>/dev/null | head -1)
+            OUT_NAME="HGhub-release.apk"
           else
-            cp "$APK_DIR/debug/app-debug.apk" artifacts/HGhub-debug.apk
+            FOUND_APK=$(find "$APK_ROOT" -name "*.apk" -path "*debug*" -type f 2>/dev/null | head -1)
+            OUT_NAME="HGhub-debug.apk"
           fi
+
+          # 兜底:如果按类型没找到,直接取第一个 apk 文件
+          if [ -z "$FOUND_APK" ]; then
+            echo "按类型($TYPE)未找到 APK,尝试取任意 APK..."
+            FOUND_APK=$(find "$APK_ROOT" -name "*.apk" -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$FOUND_APK" ]; then
+            echo "找到 APK: $FOUND_APK"
+            cp "$FOUND_APK" "artifacts/$OUT_NAME"
+            echo "已复制为: artifacts/$OUT_NAME"
+          else
+            echo "错误: 在 $APK_ROOT 下未找到任何 APK 文件"
+            echo "=== 列出 build/outputs 完整结构 ==="
+            find "src-tauri/gen/android/app/build/outputs" -type f 2>/dev/null || echo "(outputs 目录不存在)"
+            exit 1
+          fi
+
+          echo "=== artifacts 目录内容 ==="
           ls -lh artifacts/
 
       # ---- 10. 上传为 Artifact(手动触发时)----
