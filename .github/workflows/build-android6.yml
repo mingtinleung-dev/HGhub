@@ -140,15 +140,17 @@ jobs:
           fi
 
       # ---- 8. 构建 APK ----
+      # 必须传 --target 指定所有架构,否则 Tauri 只编译默认的 aarch64
+      # BlueStacks 是 x86_64,缺少 x86_64 的 .so 会导致安装失败
       # Tauri 2 的 android build 默认即 debug,无需也不能传 --debug
       # release 需显式传 --release
       - name: Build APK (debug)
         if: github.event.inputs.build_type != 'release'
-        run: pnpm android:build
+        run: pnpm android:build -- --target aarch64 --target armv7 --target x86_64
 
       - name: Build APK (release)
         if: github.event.inputs.build_type == 'release' || startsWith(github.ref, 'refs/tags/v')
-        run: pnpm android:build -- --release
+        run: pnpm android:build -- --target aarch64 --target armv7 --target x86_64 --release
 
       # ---- 9. 收集产物 ----
       # 不硬编码 APK 路径,自动递归搜索整个 build/outputs 目录
@@ -198,6 +200,120 @@ jobs:
           fi
 
           echo "=== artifacts 目录内容 ==="
+          ls -lh artifacts/
+
+      # ---- 9.5 诊断 APK 内容 ----
+      # 检查 APK 内的架构(.so 文件)、签名状态,方便排查安装失败问题
+      - name: Diagnose APK (architecture & signing)
+        run: |
+          echo "=== 安装诊断工具 ==="
+          sudo apt-get update -qq && sudo apt-get install -y -qq aapt unzip > /dev/null 2>&1 || true
+
+          APK_FILE=$(find artifacts -name "*.apk" -type f | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "未找到 APK 文件,跳过诊断"
+            exit 0
+          fi
+          echo "诊断 APK: $APK_FILE"
+          echo ""
+
+          echo "========== 1. APK 内的 native 库(.so)架构 =========="
+          # 列出 APK 内所有 .so 文件,判断包含哪些 CPU 架构
+          unzip -l "$APK_FILE" | grep "\.so$" || echo "(APK 内没有任何 .so 文件! 这会导致无法启动)"
+          echo ""
+          echo "包含的架构目录:"
+          unzip -l "$APK_FILE" | grep -oE "lib/[a-z0-9_-]+/" | sort -u || echo "(无 lib 目录)"
+
+          echo ""
+          echo "========== 2. APK 基本信息 =========="
+          aapt dump badging "$APK_FILE" 2>/dev/null | grep -E "^(package|application-label|sdkVersion|targetSdkVersion|native-code)" || echo "(aapt 不可用或解析失败)"
+
+          echo ""
+          echo "========== 3. 签名状态 =========="
+          # 检查是否包含 META-INF 下的签名文件
+          SIG_FILES=$(unzip -l "$APK_FILE" | grep "META-INF/.*\.\(RSA\|DSA\|EC\)" | awk '{print $NF}')
+          if [ -n "$SIG_FILES" ]; then
+            echo "已签名 ✓"
+            echo "签名文件: $SIG_FILES"
+          else
+            echo "未签名 ✗ (APK 没有签名,无法直接安装!)"
+          fi
+
+          echo ""
+          echo "========== 4. 文件大小 =========="
+          ls -lh "$APK_FILE"
+
+      # ---- 9.6 签名 APK ----
+      # Tauri 2 输出的是未签名 APK,必须签名后才能安装
+      # debug 构建用 Android 默认 debug keystore 签名(可直接装模拟器+真机)
+      # release 构建生成专用 keystore 签名(便于后续发布)
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+
+          # 找到待签名的 APK
+          UNSIGNED_APK=$(find artifacts -name "*.apk" -type f | head -1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "未找到 APK 文件,跳过签名"
+            exit 1
+          fi
+          echo "待签名 APK: $UNSIGNED_APK"
+
+          # 定位 build-tools 中的 apksigner 和 zipalign
+          BUILD_TOOLS_DIR="$ANDROID_HOME/build-tools/34.0.0"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+
+          if [ ! -f "$APKSIGNER" ]; then
+            echo "apksigner 不存在: $APKSIGNER"
+            ls "$BUILD_TOOLS_DIR/" | head -20
+            exit 1
+          fi
+
+          # === 准备签名 keystore ===
+          KEYSTORE="$HOME/debug.keystore"
+          KEYSTORE_PASS="android"
+          KEY_ALIAS="androiddebugkey"
+          KEY_PASS="android"
+
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "生成 debug keystore..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" \
+              -storepass "$KEYSTORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # === zipalign 对齐 ===
+          ALIGNED_APK="artifacts/aligned.apk"
+          echo "对齐 APK..."
+          "$ZIPALIGN" -f -v 4 "$UNSIGNED_APK" "$ALIGNED_APK" > /dev/null
+
+          # === apksigner 签名 ===
+          SIGNED_APK="artifacts/HGhub-signed.apk"
+          echo "签名 APK..."
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+
+          # === 验证签名 ===
+          echo ""
+          echo "=== 验证签名 ==="
+          "$APKSIGNER" verify --verbose "$SIGNED_APK" || true
+
+          # === 清理中间文件,用签名后的替换原始 APK ===
+          rm -f "$ALIGNED_APK"
+          mv "$SIGNED_APK" "$UNSIGNED_APK"
+
+          echo ""
+          echo "=== 签名完成,最终产物 ==="
           ls -lh artifacts/
 
       # ---- 10. 上传为 Artifact(手动触发时)----
